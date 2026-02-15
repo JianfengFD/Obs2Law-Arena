@@ -18,7 +18,7 @@ Obs2Law-ARENA is designed to be a **public, reproducible benchmark + training gr
 - **Baseline model development**: include/host reference pipelines that operate on the same observation interface.
 
 Core principle: **you don’t get the state**. You get images (and minimal public metadata), and you control *when/where/how* you observe.
-
+<img src="obs2law.png" width="50%">
 ---
 
 ## Two benchmark worlds
@@ -37,7 +37,7 @@ Typical tasks:
 - recover gravity parameters / curve g(z)
 - predict future frames under the same hidden physics
 - compare methods under identical observation controls
-
+<img src="room-phys.png" width="50%">
 ---
 
 ### 2) Celestial Observation (Sky): planetary dynamics from a virtual telescope
@@ -52,7 +52,7 @@ A sealed “virtual observatory” where you stand on Earth and observe a simula
 As with RoomPhys:
 - **Practice mode** exposes ground truth for learning and debugging.
 - **Competition mode** seals the true parameters and orbital data.
-
+<img src="activeviewsky.png" width="50%">
 ---
 
 ## Baseline attempt included: O2T Network (Observation → Theory)
