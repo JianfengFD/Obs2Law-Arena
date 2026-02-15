@@ -1,75 +1,88 @@
-Here is a detailed textual summary of the network structure and the training methodology.
+
 
 ### I. Network Architecture (`O2TNet`)
 
-The system acts as an "Observation-to-Theory" engine. It encodes high-dimensional visual observations into a compact latent state, evolves that state using a hybrid neural-physical engine, and decodes the result to predict future frames. The model is designed to process images at full resolution (e.g., ) without resizing, preserving fine spatial details.
+The system is an end-to-end encoder-decoder architecture designed to infer latent physical parameters from high-resolution stereo image sequences and predict future states. It operates on **native resolution inputs** (e.g., ) without artificial resizing to preserve fine details.
 
-#### 1. Input Representation
+#### 1. Input Construction (23 Channels)
 
-The network constructs a dense **23-channel input tensor** to capture the state of the system at two initial time steps ( and ) via stereo vision:
+The network constructs a dense input tensor representing the system state at two time steps ( and ):
 
-* **Visual Data (12 channels):** Four RGB images representing stereo pairs (Left/Right views) at  and .
-* **Parameter Embeddings (5 channels):** Spatially broadcasted feature maps derived from scalar parameters (time, position, rotation) via a `ParamEncoder`.
-* **Difference Maps (6 channels):** Pairwise grayscale differences between the four input images to explicitly highlight motion and disparity.
+* **Visual Data (12 ch):** Four RGB images: Stereo Left/Right at , and Stereo Left/Right at .
+* **Parameter Embeddings (5 ch):** Scalar parameters (time, position, rotation) for the 4 input views and 1 target view are encoded via a `ParamEncoder` into spatial feature maps.
+* **Difference Maps (6 ch):** Pairwise grayscale differences between the four visual inputs to explicitly highlight motion and disparity.
 
-#### 2. Encoder
+#### 2. The Encoder
 
-The encoder compresses the 23-channel input into a compact latent vector (, dim=48).
+The encoder maps the 23-channel input to a compact latent vector (, dim=48).
 
-* **Downsampling:** It employs 5 levels of convolutional downsampling. For a  input, the spatial resolution reduces progressively ().
-* **Building Blocks:** Each level consists of Residual Blocks (`ResBlock`) utilizing GroupNorm and SiLU activations.
-* **Attention:** Multi-head self-attention (`SelfAttention2d`) is applied only at the two deepest (smallest spatial) levels to capture global dependencies.
-* **Conditioning:** Adaptive scale-and-shift conditioning (`ConditionInjection`) injects parameter information at every level.
-* **Bottleneck:** The final feature map is pooled (`AdaptiveAvgPool`) and flattened into the latent vector.
+* **Hierarchy:** Uses a 5-level convolutional downsampling structure ().
+* **Components:** Each level consists of `ResBlock` units (GroupNorm, SiLU, Conv3x3).
+* **Attention:** Multi-head `SelfAttention2d` is applied only at the two deepest levels (lowest resolution) to capture global context.
+* **Output:** The final feature map is pooled (`AdaptiveAvgPool`) and projected to a **48-dimensional latent vector**.
 
-#### 3. Latent Physics Engine
+#### 3. The Physics Engine (Latent Evolution)
 
-The core of the network processes the latent vector to simulate physical evolution.
+The core module evolves the latent vector  from input state to target future state.
 
-* **Rotation Layer:** The latent vector undergoes a learnable orthogonal transformation implemented via a **Cayley transform** (constructing a rotation matrix from a skew-symmetric parameter matrix). This aligns the learned latent space with the canonical coordinate system of the physics engine.
-* **Physics Evolution (`PhysStep`):** The state evolves over time using a hybrid approach:
-* **Neural Branch:** A residual MLP processes the state abstractly.
-* **Physics Branch:** The state is split into velocity and position components. It applies a Newtonian update (, ). This branch learns explicit physical parameters, including a gravity vector () and drag/interaction coefficients ().
-* **Blending:** The outputs of the Neural and Physics branches are blended based on a weight () that decays as the prediction horizon increases, forcing the model to rely on analytical physics for long-term predictions.
+* **Alignment:** The latent vector is rotated into a canonical coordinate system using a learnable orthogonal matrix (implemented via **Cayley transform**).
+* **Evolution Loop:** The vector undergoes  steps of evolution. Each step blends two branches:
+* **Neural Branch:** A residual MLP processing abstract dynamics.
+* **Physics Branch:** Splits the vector into Velocity and Position components. Applies explicit **Newtonian updates** (, ) using learned gravity () and interaction coefficients ().
 
 
-* **Inverse Rotation:** The evolved latent vector is rotated back to the original manifold.
+* **Inverse Alignment:** The evolved vector is rotated back to the original manifold.
 
-#### 4. Decoder
+#### 4. The Decoder (Updated)
 
-The decoder is an **Hourglass** architecture that reconstructs the predicted future image using both the evolved physics state and the original visual context.
+The decoder is a standalone "Hourglass" (U-Net style) network that reconstructs the predicted image. It takes **fresh image inputs** (Left , Left , and their difference) rather than encoder features.
 
-* **Image Context:** It takes the original images at  and  (plus their difference) as a 9-channel starting input.
-* **Condition Injection:** The evolved physics latent  and target parameters are projected into 2D feature maps and injected into the decoder at three specific points: before, during, and after the spatial bottleneck.
-* **U-Net Structure:** The decoder downsamples the image context to a bottleneck and then upsamples it back to . It utilizes skip connections from the downsampling path to preserve high-frequency details.
-* **Output:** The final layer produces a 3-channel RGB image (Sigmoid activation).
+* **Structure:**
+* **Down Path:** 4 levels of downsampling.
+* **Bottleneck:** ResBlock  Attention  ResBlock at  resolution.
+* **Up Path:** 4 levels of upsampling with skip connections from the Down Path.
+
+
+* **Physics Injection Points:** The evolved physics latent vector () combined with target parameters is injected into the network at **three specific "Middle" locations** via broadcasting:
+1. **Middle-Left (Down Path):** Immediately after the first downsampling block (Level 0). Injection happens at **** resolution.
+2. **Middle-Center (Bottleneck):** Inside the bottleneck, at the lowest resolution (****).
+3. **Middle-Right (Up Path):** Immediately after the third upsampling block (Level 2). Injection happens at **** resolution.
+
+
 
 ---
 
 ### II. Training Infrastructure (`train_o2t.py`)
 
-The training system employs an asynchronous, producer-consumer architecture designed to handle expensive rendering operations without blocking the GPU.
+The training employs an asynchronous Producer-Consumer architecture to decouple rendering from training.
 
-#### 1. Asynchronous Data Generation (Producers)
+#### 1. Data Generation (Producers)
 
-* **Background Workers:** Multiple CPU threads continuously render synthetic scenes using an external module.
-* **Sample Types:** Workers generate samples in three modes:
-* `DIS_MOD`: Static scenes to learn displacement/depth.
-* `VIEW_MOD`: Changes in observer viewpoint to learn 3D structure.
-* `FUTURE_MOD`: Time evolution to learn physics dynamics.
+* **Background Workers:** Multiple CPU threads continuously render synthetic scenes.
+* **Sample Validation:** A `has_motion` check discards static samples in dynamic modes to ensure valid training signals.
+* **Modes:**
+* `DIS_MOD`: Static scenes (depth/disparity).
+* `VIEW_MOD`: Camera movement only (3D structure).
+* `FUTURE_MOD`: Time evolution (physics dynamics).
 
 
-* **Filtering:** The generator produces stereo pairs and explicitly filters out samples with insufficient motion to ensure high-quality training signals.
 
 #### 2. Replay Buffer
 
-* A thread-safe `ReplayBuffer` stores up to 5,000 recent samples.
-* New samples generated by CPU workers replace the oldest samples in the buffer.
-* The training loop samples random mini-batches from this buffer, decoupling rendering speed from training speed.
+* A thread-safe circular buffer stores up to **5,000 samples**.
+* New samples from workers replace the oldest ones.
+* The GPU trains on random mini-batches sampled from this buffer.
 
-#### 3. Training Loop (Consumer)
+#### 3. Curriculum Learning
 
-* **Curriculum Learning:** A `TrainingSchedule` manages task complexity. It starts with static/displacement tasks, introduces viewpoint changes, and finally introduces physics predictions. The look-ahead window for physics predictions ( steps) increases from 1 step up to 50 steps as training progresses.
-* **Loss Function:** A composite loss of MSE () and L1 () is calculated between the predicted image and the ground-truth rendered target.
-* **Optimization:** The model is optimized using **AdamW** with Cosine Annealing learning rate scheduling.
-* **Physics Weight Schedule:** The blending weight  is dynamically computed; it is high for short-term predictions (allowing the Neural branch to correct details) and low for long-term predictions (forcing reliance on the Physics branch).
+A `TrainingSchedule` manages task complexity based on global steps:
+
+* **0–1k:** Static/Displacement only.
+* **1k–10k:** Mixed Static and Viewpoint changes.
+* **10k–50k:** Introduces Physics with short horizons ().
+* **50k+:** Primarily Physics with increasing horizons ( up to 50).
+
+#### 4. Optimization
+
+* **Loss:** Composite loss of .
+* **Physics Weight Schedule:** The blending weight  (Neural vs. Analytical) decays exponentially as the prediction horizon  increases, forcing the model to rely on analytical physics for long-term predictions.
