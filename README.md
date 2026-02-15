@@ -90,6 +90,45 @@ The repository is intended to be modular:
 
 ---
 
+## Leaderboard
+
+This competition is **open and ongoing** — submissions are accepted at any time.
+
+### Overall Rankings
+
+| Rank | Team | Model | Repo / Link | RoomPhys Score | SkyObs Score | g₀ err | α(room) err | α(sky) err | tilt err (°) |
+|---|---|---|---|---|---|---|---|---|---|
+| — | — | — | — | — | — | — | — | — | — |
+
+*Scores: lower is better. Errors are reported as mean ± std across all test problems.*
+
+---
+
+### How to Participate
+
+#### RoomPhys (Room-Scale Physics)
+
+The RoomPhys challenge is open for submission now. Follow the instructions in `room_phys/README_PARTICIPANT_ROOMPHYS.md` to:
+
+1. Build and train your model using the practice scenes (ground truth available)
+2. Run training on the **five sealed gravity fields** provided in competition mode
+3. Submit your results (predicted g₀, α, and gravity curves) to **lijf@fudan.edu.cn**
+
+#### SkyObs (Celestial Observation)
+
+For the Sky challenge, we recommend starting with **practice mode** (see `sky_obs/README_SKY_PRACTICE.md`) to familiarise yourself with the virtual telescope and develop your pipeline.
+
+The competition trajectory file (`trajectory_P1T.enc`, ~9 GB, ~1000 years of simulated data) is currently distributed on request. A public download link may be provided in the future.
+
+**To request competition data**: contact **lijf@fudan.edu.cn** with your team name and a brief description.
+
+#### Tips
+
+- **Cross-domain pre-training**: training on RoomPhys data first (or jointly) may improve SkyObs performance — both tasks share the core challenge of inferring gravity laws from visual observations, and the RoomPhys data is unlimited and fast to generate.
+- **Multi-task models**: a single model that handles both benchmarks is encouraged but not required.
+
+---
+
 ## License
 This project is licensed under the Apache-2.0 License - see the LICENSE file for details.
 
