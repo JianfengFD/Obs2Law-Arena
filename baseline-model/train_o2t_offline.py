@@ -80,7 +80,6 @@ def collate_fn(batch):
     pics = torch.stack([b[0] for b in batch])
     params = torch.stack([b[1] for b in batch])
     targets = torch.stack([b[2] for b in batch])
-    # Use max n_steps in batch (minor approximation for batching efficiency)
     n_steps = max(b[3] for b in batch)
     return pics, params, targets, n_steps
 
@@ -183,10 +182,12 @@ def train(args):
               f"({s['meta'].get('n_samples', '?')} samples, "
               f"{s['epochs']} epochs)")
 
-    # Model
+    # Model (native resolution, no img_size needed)
     model = O2TNet(
-        img_size=args.img_size, latent_dim=args.latent_dim,
-        vel_dim=args.latent_dim // 2, param_dim=6, base_ch=args.base_ch,
+        latent_dim=args.latent_dim,
+        vel_dim=args.latent_dim // 2,
+        param_dim=6,
+        base_ch=args.base_ch,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -293,7 +294,6 @@ def main():
     ap.add_argument("--data_dir", required=True,
                     help="Directory with stage1_*, stage2_*, etc.")
     ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--img_size", type=int, default=64)
     ap.add_argument("--latent_dim", type=int, default=48)
     ap.add_argument("--base_ch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)

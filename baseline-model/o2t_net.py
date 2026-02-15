@@ -347,67 +347,119 @@ class RotationLayer(nn.Module):
 
 
 # =====================================================================
-# Decoder — mirrors encoder, upsamples back to original resolution
+# Decoder — Hourglass: PIC1+PIC3+diff → predicted image
 # =====================================================================
 
 class Decoder(nn.Module):
     """
-    Latent + skip connections → predicted image at full resolution.
+    Hourglass decoder: takes PIC1, PIC3, and their difference as
+    image-space input (9ch @ 512×512), downsamples to a bottleneck,
+    then upsamples back to 512×512.
 
-    Mirrors the encoder's 5 downsampling levels:
-      bottleneck → 32→64→128→256→512  (for 512 input)
+    The physics latent h_48 and para5 are injected via Dense→Reshape
+    at the three middle layers (just before, at, and just after the
+    bottleneck), providing the "what should change" signal while the
+    image input provides the "what does the scene look like" signal.
 
-    Skip connections from encoder are concatenated at each level.
+    Structure (base_ch=32):
+        Input: 9ch, 512×512
+        ─ Down ─
+        Level 0: Conv 9→16,   512→256
+        Level 1: ResBlock 32, 256→128
+        Level 2: ResBlock 64, 128→64     ← inject h_cond (middle-left)
+        ─ Bottleneck ─
+        Level 3: ResBlock 128, 64→32     ← inject h_cond (middle)
+        ─ Up ─
+        Level 4: ResBlock 128, 32→64     ← inject h_cond (middle-right)
+        Level 5: ResBlock 64,  64→128   (+ skip from level 2)
+        Level 6: ResBlock 32,  128→256  (+ skip from level 1)
+        Level 7: ResBlock 16,  256→512  (+ skip from level 0)
+        Output: Conv→3ch, Sigmoid
     """
-    def __init__(self, out_ch=3, latent_dim=48, base_ch=32,
-                 cond_dim=48, para5_dim=6, bottleneck_spatial=16):
+    def __init__(self, latent_dim=48, para5_dim=6, base_ch=32):
         super().__init__()
-        # Channel schedule (reverse of encoder)
-        chs = [base_ch * 8, base_ch * 4, base_ch * 2,
-               base_ch, base_ch // 2]
+        # Channel schedule: two-sided, thin at edges, fat in middle
+        # For base_ch=32: [16, 32, 64, 128, 128, 64, 32, 16]
+        ch_down = [base_ch // 2, base_ch, base_ch * 2, base_ch * 4]
+        ch_up   = [base_ch * 4, base_ch * 2, base_ch, base_ch // 2]
 
-        top_ch = chs[0]
-        bs = bottleneck_spatial
-        self.latent_proj = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.SiLU(),
-            nn.Linear(256, top_ch * bs * bs),
-        )
-        self.top_ch = top_ch
-        self.bottleneck_spatial = bs
+        # ── Condition projection (h_48 + para5 → cond vector) ──
+        cond_dim = latent_dim + para5_dim  # 48 + 6 = 54
+        self.cond_dim = cond_dim
 
-        self.para5_proj = nn.Sequential(
-            nn.Linear(para5_dim, 128), nn.SiLU(),
-            nn.Linear(128, cond_dim),
-        )
-        self.latent_cond_proj = nn.Sequential(
-            nn.Linear(latent_dim, 128), nn.SiLU(),
-            nn.Linear(128, cond_dim),
-        )
+        # Three injection points (all produce 1-channel maps, broadcast-added):
+        #   inject₁: after down level 0 → 1×256×256
+        #   inject₂: at bottleneck     → 1× 32× 32
+        #   inject₃: after up level 2  → 1×256×256
+        #
+        # Dense→(1,16,16)→Upsample to target size. Broadcast across channels.
+        inject_specs = [
+            (256, 16, 4),  # (target_spatial, dense_spatial, n_upsample)
+            ( 32,  8, 2),
+            (256, 16, 4),
+        ]
+        self.inject_projs = nn.ModuleList()
+        self.inject_ups = nn.ModuleList()
+        for target_s, dense_s, n_up in inject_specs:
+            self.inject_projs.append(nn.Sequential(
+                nn.Linear(cond_dim, 256),
+                nn.SiLU(),
+                nn.Linear(256, dense_s * dense_s),  # → 1ch, dense_s×dense_s
+            ))
+            up_layers = []
+            for _ in range(n_up):
+                up_layers.extend([
+                    nn.Upsample(scale_factor=2, mode='bilinear',
+                                align_corners=False),
+                    nn.Conv2d(1, 1, 3, padding=1),
+                    nn.SiLU(),
+                ])
+            self.inject_ups.append(nn.Sequential(*up_layers) if up_layers
+                                   else nn.Identity())
+        self.inject_specs = inject_specs
 
-        self.ups = nn.ModuleList()
-        self.cond_injects = nn.ModuleList()
-        ch = top_ch
+        # ── Down path ──
+        self.in_conv = nn.Conv2d(9, ch_down[0], 3, padding=1)
 
-        for i, next_ch in enumerate(chs):
-            in_ch = ch + ch  # concat skip
-            layers = nn.ModuleList([
-                nn.Conv2d(in_ch, ch, 1),     # merge skip
+        self.down_blocks = nn.ModuleList()
+        ch = ch_down[0]
+        for i, out_ch in enumerate(ch_down):
+            block = nn.Sequential(
                 ResBlock(ch),
-                ResBlock(ch),
-            ])
-            # Attention at lowest levels only
-            if i < 2:
-                layers.append(SelfAttention2d(ch))
-            else:
-                layers.append(nn.Identity())
-            layers.append(Upsample(ch))
-            out_ch = chs[i + 1] if i + 1 < len(chs) else chs[-1]
-            layers.append(nn.Conv2d(ch, out_ch, 1))
-            self.ups.append(layers)
-            self.cond_injects.append(ConditionInjection(cond_dim, ch))
+                nn.Conv2d(ch, out_ch, 1) if ch != out_ch else nn.Identity(),
+                ResBlock(out_ch),
+                Downsample(out_ch),
+            )
+            self.down_blocks.append(block)
             ch = out_ch
 
+        # ── Bottleneck ──
+        self.mid = nn.Sequential(
+            ResBlock(ch),
+            SelfAttention2d(ch),
+            ResBlock(ch),
+        )
+
+        # ── Up path ──
+        self.up_blocks = nn.ModuleList()
+        self.up_merges = nn.ModuleList()  # 1×1 conv to merge skip
+        for i, out_ch in enumerate(ch_up):
+            if i >= 1:
+                # Has skip connection from corresponding down level
+                in_ch = ch + ch_down[len(ch_down) - 1 - i]
+                self.up_merges.append(nn.Conv2d(in_ch, ch, 1))
+            else:
+                self.up_merges.append(nn.Identity())
+            block = nn.Sequential(
+                Upsample(ch),
+                ResBlock(ch),
+                nn.Conv2d(ch, out_ch, 1) if ch != out_ch else nn.Identity(),
+                ResBlock(out_ch),
+            )
+            self.up_blocks.append(block)
+            ch = out_ch
+
+        # ── Output ──
         self.out = nn.Sequential(
             ResBlock(ch),
             nn.GroupNorm(min(8, ch), ch),
@@ -416,32 +468,60 @@ class Decoder(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, h_latent, skips, para5=None):
-        B = h_latent.shape[0]
-        bs = self.bottleneck_spatial
-        h = self.latent_proj(h_latent).view(B, self.top_ch, bs, bs)
+    def forward(self, pic1, pic3, h_latent, para5):
+        """
+        pic1: (B, 3, H, W) — left eye at t1
+        pic3: (B, 3, H, W) — left eye at t2
+        h_latent: (B, latent_dim) — physics-evolved latent
+        para5: (B, para5_dim) — target viewpoint params
 
-        cond = self.latent_cond_proj(h_latent)
-        if para5 is not None:
-            cond = cond + self.para5_proj(para5)
+        Returns: (B, 3, H, W) predicted image
+        """
+        B = pic1.shape[0]
 
+        # Build 9-channel input: PIC1 + PIC3 + (PIC1-PIC3)
+        diff = pic1 - pic3
+        x = torch.cat([pic1, pic3, diff], dim=1)  # (B, 9, H, W)
+
+        # Build condition vector
+        h_cond = torch.cat([h_latent, para5], dim=1)  # (B, cond_dim)
+
+        # Pre-compute injection maps: 1-channel, broadcast across all channels
+        injects = []
+        for i, (target_s, dense_s, n_up) in enumerate(self.inject_specs):
+            feat = self.inject_projs[i](h_cond)          # (B, ds*ds)
+            feat = feat.view(B, 1, dense_s, dense_s)     # (B, 1, ds, ds)
+            feat = self.inject_ups[i](feat)               # (B, 1, target_s, target_s)
+            injects.append(feat)  # broadcast-add: (B,1,s,s) + (B,C,s,s)
+
+        # ── Down path ──
+        h = self.in_conv(x)
+        skips = []
+        for i, block in enumerate(self.down_blocks):
+            skips.append(h)
+            h = block(h)
+            # Inject after level 0 (256×256)
+            if i == 0:
+                h = h + injects[0]
+
+        # ── Bottleneck (32×32) ──
+        h = self.mid(h)
+        h = h + injects[1]
+
+        # ── Up path ──
         skips_rev = list(reversed(skips))
-
-        for i, blocks in enumerate(self.ups):
-            merge, res1, res2, attn, up, proj = blocks
-            skip_idx = min(i, len(skips_rev) - 1)
-            skip = skips_rev[skip_idx]
-            if skip.shape[2:] != h.shape[2:]:
-                skip = F.interpolate(skip, size=h.shape[2:],
-                                     mode='bilinear', align_corners=False)
-            h = torch.cat([h, skip], dim=1)
-            h = merge(h)
-            h = res1(h)
-            h = self.cond_injects[i](h, cond)
-            h = res2(h)
-            h = attn(h)
-            h = up(h)
-            h = proj(h)
+        for i, (block, merge) in enumerate(zip(self.up_blocks, self.up_merges)):
+            if i >= 1:
+                skip = skips_rev[i]
+                if skip.shape[2:] != h.shape[2:]:
+                    skip = F.interpolate(skip, size=h.shape[2:],
+                                         mode='bilinear', align_corners=False)
+                h = torch.cat([h, skip], dim=1)
+                h = merge(h)
+            h = block(h)
+            # Inject after up level 2 (256×256)
+            if i == 2:
+                h = h + injects[2]
 
         return self.out(h)
 
@@ -454,10 +534,14 @@ class O2TNet(nn.Module):
     """
     Full Observation-to-Theory network.
     Processes images at their NATIVE resolution (e.g. 512×512).
-    No artificial resizing.
+
+    Encoder: 23ch input → h_48 latent (convolutional downsampling)
+    Physics: h_48 → W_ROT → PhysEvolution × n → W_ROT_INV → h_out
+    Decoder: PIC1 + PIC3 + diff → hourglass UNet, with h_out and para5
+             injected at middle layers via Dense→Reshape
 
     Input:
-      pics: (B, 4, 3, H, W) — stereo pairs, any resolution
+      pics: (B, 4, 3, H, W) — stereo pairs
       params: (B, 5, 6) — [t, x, y, z, az, el]
 
     Output:
@@ -489,14 +573,10 @@ class O2TNet(nn.Module):
             nn.Linear(64, latent_dim),
         )
 
-        # Decoder: latent + skips → image
-        # bottleneck_spatial: after 5 downsamples, 512→16, 256→8
-        # We use AdaptiveAvgPool in encoder so decoder needs a fixed start size
-        self.decoder_start_size = 16  # works for 512 input (512/32=16)
+        # Decoder: PIC1+PIC3+diff hourglass, latent injected at middle
         self.decoder = Decoder(
-            out_ch=3, latent_dim=latent_dim, base_ch=base_ch,
-            cond_dim=latent_dim, para5_dim=param_dim,
-            bottleneck_spatial=self.decoder_start_size,
+            latent_dim=latent_dim, para5_dim=param_dim,
+            base_ch=base_ch,
         )
 
     def preprocess_params(self, params):
@@ -510,54 +590,34 @@ class O2TNet(nn.Module):
     def build_input_tensor(self, pics, params, H, W):
         """
         Build 23-channel input tensor at native resolution.
-
-        pics: (B, 4, 3, H, W) — full resolution RGB
-        params: (B, 5, 6) — preprocessed
-        H, W: spatial size
-
+        pics: (B, 4, 3, H, W), params: (B, 5, 6)
         Returns: (B, 23, H, W)
         """
         B = pics.shape[0]
-
-        # Grayscale for difference images
         gray = pics.mean(dim=2, keepdim=False)  # (B, 4, H, W)
-
-        # Parameter images (generated at 8×8, upsampled to H×W)
-        para_imgs = []
-        for i in range(5):
-            para_imgs.append(self.param_enc(params[:, i], H))
-
-        # Pairwise grayscale differences
+        para_imgs = [self.param_enc(params[:, i], H) for i in range(5)]
         diffs = []
         for i in range(4):
             for j in range(i + 1, 4):
                 diffs.append(gray[:, i:i+1] - gray[:, j:j+1])
-
-        # Assemble: 4×(3+1) + 1 + 6 = 23 channels
         channels = []
         for i in range(4):
-            channels.append(pics[:, i])          # RGB (B, 3, H, W)
-            channels.append(para_imgs[i])        # PARA (B, 1, H, W)
-        channels.append(para_imgs[4])            # PARA5 (B, 1, H, W)
-        channels.extend(diffs)                   # 6 diffs (B, 1, H, W)
-
+            channels.append(pics[:, i])
+            channels.append(para_imgs[i])
+        channels.append(para_imgs[4])
+        channels.extend(diffs)
         return torch.cat(channels, dim=1)
 
     def forward(self, pics, params, n_steps=1, dt=0.02, w_nn=0.5):
         """
-        pics: (B, 4, 3, H, W) float [0,1], any resolution
+        pics: (B, 4, 3, H, W) float [0,1]
         params: (B, 5, 6)
-        n_steps: int
-        dt: float
-        w_nn: float
-
-        Returns: predicted image (B, 3, H_out, W_out)
-          H_out = closest multiple of 32 to H (for clean up/downsampling)
+        Returns: predicted image (B, 3, H, W)
         """
         params_pp = self.preprocess_params(params)
         B, _, _, H_orig, W_orig = pics.shape
 
-        # Pad/resize to multiple of 32 for clean 5× downsample
+        # Pad to multiple of 32 for clean 5× downsample
         H32 = ((H_orig + 31) // 32) * 32
         W32 = ((W_orig + 31) // 32) * 32
         if H32 != H_orig or W32 != W_orig:
@@ -568,11 +628,11 @@ class O2TNet(nn.Module):
         else:
             pics_p = pics
 
-        # Build 23-channel input at full resolution
+        # Build 23-channel encoder input
         x_23 = self.build_input_tensor(pics_p, params_pp, H32, W32)
 
-        # Encode (convolutional downsampling, no resize)
-        h_48, skips = self.encoder(x_23)
+        # Encode
+        h_48, _skips = self.encoder(x_23)
 
         # Physics pipeline
         h_rot = self.rotation(h_48)
@@ -583,14 +643,15 @@ class O2TNet(nn.Module):
         h_para = self.para5_to_h(para5)
         h_out = h_inv + h_para
 
-        # Decode (convolutional upsampling to full resolution)
-        pred = self.decoder(h_out, skips, para5)
+        # Decode: PIC1 + PIC3 as image context, h_out as physics signal
+        pic1 = pics_p[:, 0]  # (B, 3, H, W) left eye at t1
+        pic3 = pics_p[:, 2]  # (B, 3, H, W) left eye at t2
+        pred = self.decoder(pic1, pic3, h_out, para5)
 
-        # Crop back to original size if we padded
+        # Crop back if padded
         if H32 != H_orig or W32 != W_orig:
             pred = F.interpolate(pred, size=(H_orig, W_orig),
                                  mode='bilinear', align_corners=False)
-
         return pred
 
     def get_physics_params(self):
