@@ -236,6 +236,7 @@ Your score is computed by `score_room.py` (provided by the organiser):
 ```bash
 python score_room.py --submission submit_room.txt --keys key_a1b.txt key_c3f.txt
 ```
+(Please note that the evaluation keys are held privately by the organizers. To submit your entry for the current version, please send your answer file and model repository to lijf@fudan.edu.cn. Upon verification, we will update the leaderboard. The competition is ongoing and accepts submissions year-round.)
 
 The score combines two metrics (lower is better):
 
