@@ -67,6 +67,7 @@ python train_o2t.py --module render_scene_a1e
  └─────────────────────────────────────────────────────────────┘
 ```
 <img src="o2t_structure.png" width="90%">
+By NotebookLM
 ---
 
 ## Encoder
