@@ -3,7 +3,7 @@
 ## Overview
 
 The O2T (Observation-to-Theory) network discovers physics laws from 512×512 rendered images. It has an explicit physics-informed bottleneck with learnable Newtonian parameters (g0, α) that converge to real gravity values during training.
-<img src="o2t.png" width="50%">
+<img src="o2t.png" width="90%">
 
 **No artificial resizing** — the network processes 512×512 images natively through convolutional downsampling, preserving fine spatial detail critical for physics inference.
 
@@ -66,7 +66,7 @@ python train_o2t.py --module render_scene_a1e
  │                                                             │
  └─────────────────────────────────────────────────────────────┘
 ```
-<img src="o2t_structure.png" width="50%">
+<img src="o2t_structure.png" width="90%">
 ---
 
 ## Encoder
