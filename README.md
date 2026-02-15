@@ -18,6 +18,7 @@ Obs2Law-ARENA is designed to be a **public, reproducible benchmark + training gr
 - **Baseline model development**: include/host reference pipelines that operate on the same observation interface.
 
 Core principle: **you don’t get the state**. You get images (and minimal public metadata), and you control *when/where/how* you observe.
+
 <img src="obs2law.png" width="50%">
 ---
 
