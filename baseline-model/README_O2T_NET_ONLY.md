@@ -1,71 +1,75 @@
-Here is a detailed summary of the Observation-to-Theory (O2T) network architecture and its training infrastructure.
+Here is a detailed textual summary of the network structure and the training methodology.
 
-### Network Architecture (`O2TNet`)
+### I. Network Architecture (`O2TNet`)
 
-The O2T network is an encoder-decoder architecture designed to infer physical parameters from high-resolution image sequences and predict future states. It operates on full-resolution inputs (e.g., 512×512) without artificial resizing, utilizing a specialized latent physics engine.
+The system acts as an "Observation-to-Theory" engine. It encodes high-dimensional visual observations into a compact latent state, evolves that state using a hybrid neural-physical engine, and decodes the result to predict future frames. The model is designed to process images at full resolution (e.g., ) without resizing, preserving fine spatial details.
 
-**1. Input Processing**
-The network constructs a dense, 23-channel input tensor representing the state of the system at two time steps ( and ) via stereo vision:
+#### 1. Input Representation
 
-* **Visual Data:** 4 RGB images (12 channels) consisting of stereo pairs (Left/Right) at  and .
-* **Parameter Embeddings:** 5 channels of spatially broadcasted feature maps derived from scalar parameters (time, position, rotation) encoded via a `ParamEncoder`.
-* **Difference Maps:** 6 channels of pairwise grayscale differences between the four input images to explicitly highlight motion and disparity.
+The network constructs a dense **23-channel input tensor** to capture the state of the system at two initial time steps ( and ) via stereo vision:
 
-**2. Encoder**
-The encoder maps the 23-channel input to a compact latent vector (, dim=48).
+* **Visual Data (12 channels):** Four RGB images representing stereo pairs (Left/Right views) at  and .
+* **Parameter Embeddings (5 channels):** Spatially broadcasted feature maps derived from scalar parameters (time, position, rotation) via a `ParamEncoder`.
+* **Difference Maps (6 channels):** Pairwise grayscale differences between the four input images to explicitly highlight motion and disparity.
 
-* **Downsampling:** It employs 5 levels of convolutional downsampling. For a 512×512 input, the spatial resolution reduces progressively ().
+#### 2. Encoder
+
+The encoder compresses the 23-channel input into a compact latent vector (, dim=48).
+
+* **Downsampling:** It employs 5 levels of convolutional downsampling. For a  input, the spatial resolution reduces progressively ().
 * **Building Blocks:** Each level consists of Residual Blocks (`ResBlock`) utilizing GroupNorm and SiLU activations.
 * **Attention:** Multi-head self-attention (`SelfAttention2d`) is applied only at the two deepest (smallest spatial) levels to capture global dependencies.
 * **Conditioning:** Adaptive scale-and-shift conditioning (`ConditionInjection`) injects parameter information at every level.
 * **Bottleneck:** The final feature map is pooled (`AdaptiveAvgPool`) and flattened into the latent vector.
 
-**3. Latent Physics Engine**
+#### 3. Latent Physics Engine
+
 The core of the network processes the latent vector to simulate physical evolution.
 
-* **Rotation Layer:** The latent vector undergoes a learnable orthogonal transformation implemented via a Cayley transform (constructing a rotation matrix from a skew-symmetric parameter matrix). This aligns the latent space with the canonical coordinate system of the physics engine.
-* **Physics Evolution (`PhysStep`):** The network evolves the state over time using a hybrid approach:
+* **Rotation Layer:** The latent vector undergoes a learnable orthogonal transformation implemented via a **Cayley transform** (constructing a rotation matrix from a skew-symmetric parameter matrix). This aligns the learned latent space with the canonical coordinate system of the physics engine.
+* **Physics Evolution (`PhysStep`):** The state evolves over time using a hybrid approach:
 * **Neural Branch:** A residual MLP processes the state abstractly.
 * **Physics Branch:** The state is split into velocity and position components. It applies a Newtonian update (, ). This branch learns explicit physical parameters, including a gravity vector () and drag/interaction coefficients ().
 * **Blending:** The outputs of the Neural and Physics branches are blended based on a weight () that decays as the prediction horizon increases, forcing the model to rely on analytical physics for long-term predictions.
 
 
-* **Inverse Rotation:** The evolved latent vector is rotated back to the original manifold using the inverse of the learned orthogonal matrix.
+* **Inverse Rotation:** The evolved latent vector is rotated back to the original manifold.
 
-**4. Decoder**
-The decoder reconstructs the predicted future image from the evolved latent vector.
+#### 4. Decoder
 
-* **Upsampling:** It mirrors the encoder structure with 5 upsampling levels using nearest-neighbor interpolation followed by convolution.
-* **Skip Connections:** It concatenates features from the encoder at corresponding resolutions to preserve high-frequency details.
-* **Future Conditioning:** The target time and viewpoint parameters are encoded and injected into the bottleneck and subsequent layers via `ConditionInjection`.
-* **Output:** The final layer produces a 3-channel RGB image (Sigmoid activation) matching the input resolution.
+The decoder is an **Hourglass** architecture that reconstructs the predicted future image using both the evolved physics state and the original visual context.
+
+* **Image Context:** It takes the original images at  and  (plus their difference) as a 9-channel starting input.
+* **Condition Injection:** The evolved physics latent  and target parameters are projected into 2D feature maps and injected into the decoder at three specific points: before, during, and after the spatial bottleneck.
+* **U-Net Structure:** The decoder downsamples the image context to a bottleneck and then upsamples it back to . It utilizes skip connections from the downsampling path to preserve high-frequency details.
+* **Output:** The final layer produces a 3-channel RGB image (Sigmoid activation).
 
 ---
 
-### Training Infrastructure (`train_o2t.py`)
+### II. Training Infrastructure (`train_o2t.py`)
 
 The training system employs an asynchronous, producer-consumer architecture designed to handle expensive rendering operations without blocking the GPU.
 
-**1. Data Generation (Producers)**
+#### 1. Asynchronous Data Generation (Producers)
 
-* **Background Workers:** Multiple CPU threads continuously render synthetic scenes using a provided external module (e.g., `render_scene_a1e`).
+* **Background Workers:** Multiple CPU threads continuously render synthetic scenes using an external module.
 * **Sample Types:** Workers generate samples in three modes:
-* `DIS_MOD`: Static scenes to learn displacement and depth.
+* `DIS_MOD`: Static scenes to learn displacement/depth.
 * `VIEW_MOD`: Changes in observer viewpoint to learn 3D structure.
 * `FUTURE_MOD`: Time evolution to learn physics dynamics.
 
 
-* **Stereo & Motion:** The generator produces stereo pairs and filters out samples with insufficient motion to ensure training signal quality.
+* **Filtering:** The generator produces stereo pairs and explicitly filters out samples with insufficient motion to ensure high-quality training signals.
 
-**2. Replay Buffer**
+#### 2. Replay Buffer
 
 * A thread-safe `ReplayBuffer` stores up to 5,000 recent samples.
 * New samples generated by CPU workers replace the oldest samples in the buffer.
 * The training loop samples random mini-batches from this buffer, decoupling rendering speed from training speed.
 
-**3. Training Loop (Consumer)**
+#### 3. Training Loop (Consumer)
 
-* **Curriculum Learning:** A `TrainingSchedule` class manages complexity. It starts with static/displacement tasks, introduces viewpoint changes, and finally introduces physics predictions. The look-ahead window for physics predictions ( steps) increases from 1 step up to 50 steps as training progresses.
-* **Loss Function:** A composite loss of MSE (0.7) and L1 (0.3) is calculated between the predicted image and the ground-truth rendered target.
-* **Optimization:** The model is optimized using AdamW with Cosine Annealing learning rate scheduling.
+* **Curriculum Learning:** A `TrainingSchedule` manages task complexity. It starts with static/displacement tasks, introduces viewpoint changes, and finally introduces physics predictions. The look-ahead window for physics predictions ( steps) increases from 1 step up to 50 steps as training progresses.
+* **Loss Function:** A composite loss of MSE () and L1 () is calculated between the predicted image and the ground-truth rendered target.
+* **Optimization:** The model is optimized using **AdamW** with Cosine Annealing learning rate scheduling.
 * **Physics Weight Schedule:** The blending weight  is dynamically computed; it is high for short-term predictions (allowing the Neural branch to correct details) and low for long-term predictions (forcing reliance on the Physics branch).
